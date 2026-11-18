@@ -1,0 +1,114 @@
+name: Build patched jar
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply sneak-whole-inventory patch
+        run: |
+          cat > /tmp/p.patch <<'PATCH_EOF'
+          diff --git a/core/src/main/java/github/nighter/smartspawner/spawner/interactions/place/SpawnerPlaceListener.java b/core/src/main/java/github/nighter/smartspawner/spawner/interactions/place/SpawnerPlaceListener.java
+          index 08f9a36..7739183 100644
+          --- a/core/src/main/java/github/nighter/smartspawner/spawner/interactions/place/SpawnerPlaceListener.java
+          +++ b/core/src/main/java/github/nighter/smartspawner/spawner/interactions/place/SpawnerPlaceListener.java
+          @@ -218,7 +218,18 @@ public class SpawnerPlaceListener implements Listener {
+                   }
+           
+                   if (player.isSneaking() && Config.get().isSneakPlaceEnabled()) {
+          -            return Math.min(item.getAmount(), plugin.getConfig().getInt("spawner_properties.default.max_stack_size", 10000));
+          +            // Count every identical spawner item in the whole inventory, not just the held slot.
+          +            int available = item.getAmount();
+          +            if (player.getGameMode() != GameMode.CREATIVE) {
+          +                available = 0;
+          +                for (ItemStack invItem : player.getInventory().getStorageContents()) {
+          +                    if (invItem != null && invItem.isSimilar(item)) {
+          +                        available += invItem.getAmount();
+          +                    }
+          +                }
+          +                available = Math.max(available, item.getAmount());
+          +            }
+          +            return Math.min(available, plugin.getConfig().getInt("spawner_properties.default.max_stack_size", 10000));
+                   } else {
+                       return 1;
+                   }
+          diff --git a/core/src/main/java/github/nighter/smartspawner/spawner/interactions/stack/SpawnerStackHandler.java b/core/src/main/java/github/nighter/smartspawner/spawner/interactions/stack/SpawnerStackHandler.java
+          index 295381d..af33074 100644
+          --- a/core/src/main/java/github/nighter/smartspawner/spawner/interactions/stack/SpawnerStackHandler.java
+          +++ b/core/src/main/java/github/nighter/smartspawner/spawner/interactions/stack/SpawnerStackHandler.java
+          @@ -206,6 +206,16 @@ public class SpawnerStackHandler {
+               private boolean processStackAddition(Player player, SpawnerData targetSpawner, ItemStack itemInHand,
+                                                    boolean stackAll, int currentStack, int maxStackSize) {
+                   int itemAmount = itemInHand.getAmount();
+          +        if (stackAll && player.getGameMode() != GameMode.CREATIVE) {
+          +            // Count every identical spawner item in the whole inventory, not just the held slot.
+          +            int total = 0;
+          +            for (ItemStack invItem : player.getInventory().getStorageContents()) {
+          +                if (invItem != null && invItem.isSimilar(itemInHand)) {
+          +                    total += invItem.getAmount();
+          +                }
+          +            }
+          +            itemAmount = Math.max(total, itemAmount);
+          +        }
+                   int spaceLeft = maxStackSize - currentStack;
+           
+                   int amountToStack = stackAll ? Math.min(spaceLeft, itemAmount) : 1;
+          @@ -242,12 +252,33 @@ public class SpawnerStackHandler {
+           
+               private void updatePlayerInventory(Player player, ItemStack itemInHand, int amountUsed) {
+                   if (player.getGameMode() != GameMode.CREATIVE) {
+          -            int remainingAmount = itemInHand.getAmount() - amountUsed;
+          +            // Take from the held stack first, then from other identical stacks in the inventory.
+          +            int remaining = amountUsed;
+          +            ItemStack held = itemInHand.clone();
+           
+          -            if (remainingAmount <= 0) {
+          +            int heldTake = Math.min(remaining, itemInHand.getAmount());
+          +            if (heldTake >= itemInHand.getAmount()) {
+                           player.getInventory().setItemInMainHand(null);
+                       } else {
+          -                itemInHand.setAmount(remainingAmount);
+          +                itemInHand.setAmount(itemInHand.getAmount() - heldTake);
+          +            }
+          +            remaining -= heldTake;
+          +
+          +            if (remaining > 0) {
+          +                ItemStack[] contents = player.getInventory().getStorageContents();
+          +                for (int i = 0; i < contents.length && remaining > 0; i++) {
+          +                    ItemStack slot = contents[i];
+          +                    if (slot == null || !slot.isSimilar(held)) continue;
+          +                    int take = Math.min(remaining, slot.getAmount());
+          +                    if (take >= slot.getAmount()) {
+          +                        contents[i] = null;
+          +                    } else {
+          +                        slot.setAmount(slot.getAmount() - take);
+          +                    }
+          +                    remaining -= take;
+          +                }
+          +                player.getInventory().setStorageContents(contents);
+          +                player.updateInventory();
+                       }
+                   }
+               }
+          PATCH_EOF
+          git apply --ignore-whitespace --whitespace=nowarn /tmp/p.patch
+          git diff --stat
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        run: ./gradlew :core:shadowJar --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SmartSpawner-patched
+          path: core/build/libs/SmartSpawner-*.jar
